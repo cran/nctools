@@ -1,0 +1,167 @@
+
+#' Locate the depth where a variable reaches a given value
+#'
+#' Finds the position along one dimension of a netCDF variable where the
+#' variable reaches a target value, and writes the result to a new netCDF file.
+#' In the typical use case, this is used to estimate the depth at which a
+#' variable equals `loc`, using linear interpolation between adjacent depth
+#' levels when needed.
+#'
+#' @param filename Character string. Path to the input netCDF file.
+#' @param varid Character string. Name of the variable to analyse. If missing
+#'   and the file contains only one variable, that variable is used.
+#' @param MARGIN Integer or character string of length one. Dimension along
+#'   which the target value is searched. This can be either the dimension index
+#'   or its name (for example `"depth"`).
+#' @param loc Numeric. Target value to locate in the variable.
+#' @param output Character string. Path to the output netCDF file to create.
+#' @param drop Logical. Should degenerate dimensions be dropped? Currently not
+#'   used internally.
+#' @param newdim Reserved for future use. Currently not used internally.
+#' @param name Character string. Name of the output variable. By default, the
+#'   name of the searched dimension is used.
+#' @param longname Character string. Long name for the output variable. By
+#'   default, a descriptive name is generated automatically.
+#' @param units Character string. Units for the output variable. Currently not
+#'   used internally; by default, the units of the searched dimension are used.
+#' @param compression Numeric. Compression level for the output variable. If not
+#'   `NA`, compression is applied and netCDF4 output is required.
+#' @param verbose Logical. Should extra information be printed? Currently not
+#'   used internally.
+#' @param force_v4 Logical. Should the output file be forced to netCDF4?
+#'   Currently not used internally.
+#' @param ignore.case Logical. Ignore case when matching the dimension name in
+#'   `MARGIN`?
+#'
+#' @details
+#' The function searches for the first sign change in
+#' `variable - loc` along the selected dimension, then estimates the exact
+#' position by linear interpolation between the two surrounding grid points.
+#'
+#' The output file contains a new variable with the searched dimension removed.
+#' For example, if `MARGIN` corresponds to depth, the output is a field giving
+#' the estimated depth at which `varid` reaches `loc` for each remaining
+#' combination of dimensions.
+#'
+#' @return
+#' Invisibly returns the path to the created output file.
+#'
+#' @examples
+#' local({
+#'   input = system.file("extdata",
+#'     "temperature_profile.nc",
+#'     package = "nctools",
+#'     mustWork = TRUE)
+#'   output = tempfile(fileext = ".nc")
+#'   on.exit(unlink(output))
+#'   # Locate the 20 degree isotherm using linear interpolation in depth
+#'   nc_loc(input, "temperature", MARGIN = "depth", loc = 20, output = output)
+#'   nc = ncdf4::nc_open(output)
+#'   result = tryCatch({
+#'     list(lon = ncdf4::ncvar_get(nc, "lon"),
+#'          lat = ncdf4::ncvar_get(nc, "lat"),
+#'          depth = ncdf4::ncvar_get(nc, "depth"))
+#'   }, finally = ncdf4::nc_close(nc))
+#'
+#'   # The input profiles follow T(z) = 8 + (surface - 8) * exp(-z / scale)
+#'   surface = outer(result$lon, result$lat, function(x, y)
+#'     24 + 3 * exp(-((x + 72)^2 / 16 + (y + 15)^2 / 36)) + (y + 25) / 19)
+#'   scale = outer(result$lon, result$lat, function(x, y)
+#'     50 + 25 * ((x + 80) / 15 + (y + 25) / 19))
+#'   analytical = scale * log((surface - 8) / (20 - 8))
+#'   analytical[1:2, 1:2] = NA_real_
+#'   # Interpolation on 10 m depth intervals approximates the exact solution
+#'   error = result$depth - analytical
+#'   print(range(error, na.rm = TRUE)) # signed interpolation error in metres
+#'   print(max(abs(error), na.rm = TRUE))
+#'
+#'   image(result$lon, result$lat, result$depth,
+#'     xlab = "Longitude", ylab = "Latitude",
+#'     main = "Depth of the 20 degree isotherm (m)")
+#'   contour(result$lon, result$lat, analytical, add = TRUE)
+#'   # Contours show the analytical depth; the missing corner remains blank
+#' })
+#' @export
+nc_loc = function(filename, varid, MARGIN, loc, output=NULL, drop=TRUE,
+                  newdim = NULL, name=NULL, longname=NULL, units=NULL,
+                  compression=NA, verbose=FALSE, force_v4=TRUE,
+                  ignore.case=FALSE) {
+
+
+  if(is.null(output)) stop("You must specify an 'output'file.")
+
+  if(file.exists(output)) {
+    oTest = file.remove(output)
+    if(!oTest) stop(sprintf("Cannot write on %s.", output))
+  }
+
+  nc = nc_open(filename)
+  on.exit(nc_close(nc))
+
+  varid = .checkVarid(varid=varid, nc=nc)
+
+  dn = ncvar_dim(nc, varid, value=TRUE)
+  dnn = if(isTRUE(ignore.case)) tolower(names(dn)) else names(dn)
+
+  if(length(MARGIN)!=1) stop("MARGIN must be of length one.")
+
+  if (is.character(MARGIN)) {
+    if(isTRUE(ignore.case)) MARGIN = tolower(MARGIN)
+    MARGIN = match(MARGIN, dnn)
+    if(anyNA(MARGIN))
+      stop("not all elements of 'MARGIN' are names of dimensions")
+  }
+
+  depth = ncvar_get(nc, varid=dnn[MARGIN])
+
+  dims = nc$var[[varid]]$size
+  dims[MARGIN] = dims[MARGIN]-1
+  ind0 = c(list(X=ncvar_get(nc, varid, collapse_degen = FALSE) - loc, drop=FALSE),
+           lapply(dims, seq_len))
+
+  x0 = do.call("[", ind0)
+  ind0[[MARGIN+2]] = ind0[[MARGIN+2]]+1L
+  x1 = do.call("[", ind0)
+  x0 = sign(x0)*sign(x1)
+
+  ind = apply(x0, -MARGIN, FUN=function(x) which(x<1)[1])
+
+  D1 = depth[ind]
+  D2 = depth[ind+1]
+
+  iList = append(lapply(dims[-MARGIN], seq_len), MARGIN-1, values=NA_integer_)
+
+  index = as.matrix(do.call(expand.grid, iList))
+  index[, MARGIN] = ind
+  x1 = ind0$X[index]
+  index[, MARGIN] = ind + 1
+  x2 = ind0$X[index]
+
+  Dx = (-x1*(D2-D1))/(x2-x1) + D1
+  dim(Dx) = dims[-MARGIN]
+
+  oldVar = nc$var[[varid]]
+  newDim = nc$dim[(oldVar$dimids + 1)[-MARGIN]]
+  thisDim = nc$dim[(oldVar$dimids + 1)[MARGIN]][[1]]
+
+  if(!is.na(compression)) oldVar$compression = compression
+
+  xlongname = sprintf("%s of %s=%s %s", dnn[MARGIN], oldVar$longname, loc, oldVar$units)
+
+  varLongname = if(is.null(longname)) xlongname else longname
+  varName  = if(is.null(name)) dnn[MARGIN] else name
+  varUnits = thisDim$units
+
+  newVar = ncvar_def(name=varName, units = varUnits,
+                     missval = oldVar$missval, dim = newDim,
+                     longname = varLongname, prec = oldVar$prec,
+                     compression = oldVar$compression)
+
+  ncNew = nc_create(filename=output, vars=newVar, force_v4=force_v4)
+  ncvar_put(ncNew, varName, Dx)
+  nc_close(ncNew)
+
+  return(invisible(output))
+
+}
+
